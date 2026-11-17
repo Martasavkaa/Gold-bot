@@ -2,68 +2,304 @@ name: Gold price Poland
 
 on:
   schedule:
-    - cron: "30 15 * * 1-5"
-  workflow_dispatch:
+    # час у UTC; скрипт сам перевіряє польський час
+    - cron: "40 5,6 * * 1-5"       # ранковий звіт (07:40 за Польщею, літо і зима)
+    - cron: "*/15 8-13 * * 1-5"    # чекаємо оновлення NBP + перевірка різких змін
+    - cron: "0 7,14-20 * * 1-5"    # щогодини: перевірка різких змін
+  workflow_dispatch:               # ручний запуск з телефона
+
+permissions:
+  contents: write
+
+concurrency:
+  group: gold-bot
+  cancel-in-progress: false
 
 jobs:
   send:
     runs-on: ubuntu-latest
     steps:
-      - name: Send gold price to Telegram
+      - uses: actions/checkout@v4
+
+      - name: Run bot
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          EVENT_NAME: ${{ github.event_name }}
+          ALERT_GOLD_PCT: "1.5"      # поріг різкої зміни золота, %
+          ALERT_SILVER_PCT: "3"      # поріг різкої зміни срібла, %
         run: |
           python3 - <<'EOF'
-          import json, os, urllib.parse, urllib.request
+          import json, os, re, sys, time, copy
+          import urllib.error, urllib.parse, urllib.request
+          from datetime import datetime
+          from zoneinfo import ZoneInfo
 
-          NBP_URL = "https://api.nbp.pl/api/cenyzlota/last/30/?format=json"
-          NBP_USD_URL = "https://api.nbp.pl/api/exchangerates/rates/a/usd/?format=json"
-          OZ = 31.1034768
+          TZ = ZoneInfo("Europe/Warsaw")
+          OZ = 31.1034768  # грамів у тройській унції
+          STATE_FILE = "state.json"
 
-          def get(url):
-              req = urllib.request.Request(url, headers={"User-Agent": "gold-price-pl/1.0"})
-              with urllib.request.urlopen(req, timeout=20) as r:
-                  return json.load(r)
+          NBP_GOLD = "https://api.nbp.pl/api/cenyzlota/last/30/?format=json"
+          NBP_USD = "https://api.nbp.pl/api/exchangerates/rates/a/usd/?format=json"
+          SPOT = "https://api.gold-api.com/price/{}"
+          BAR_1G = "https://en.mennicaskarbowa.pl/zlote-sztabki/637-1-g-sztabka-zlota-wysylka-24-h.html"
+          BAR_1OZ = "https://en.mennicaskarbowa.pl/zlote-sztabki/635-1-uncja-sztabka-zlota-wysylka-24-h.html"
 
-          def build():
-              data = get(NBP_URL)
-              last = data[-1]
-              prev = data[-2] if len(data) > 1 else None
-              price = last["cena"]
-              lines = [
-                  f"🥇 Ціна золота (NBP) на {last['data']}",
-                  f"1 г: {price:.2f} PLN",
-                  f"1 унція: {price * OZ:,.0f} PLN".replace(",", " "),
-              ]
-              if prev:
-                  diff = price - prev["cena"]
-                  pct = diff / prev["cena"] * 100
-                  arrow = "📈" if diff > 0 else "📉" if diff < 0 else "➖"
-                  lines.append(f"{arrow} Зміна до {prev['data']}: {diff:+.2f} PLN ({pct:+.2f}%)")
-              month = data[-22:]
-              lines.append(
-                  f"За ~місяць: мін {min(d['cena'] for d in month):.2f} / "
-                  f"макс {max(d['cena'] for d in month):.2f} PLN"
-              )
+          # Пороги різкої зміни (у %) відносно останнього звіту/сповіщення
+          ALERT_GOLD = float(os.environ.get("ALERT_GOLD_PCT") or 1.5)
+          ALERT_SILVER = float(os.environ.get("ALERT_SILVER_PCT") or 3)
+          # Ранковий звіт: надсилається першим запуском після 07:30 (час Польщі), але не пізніше 11:00
+          MORNING_FROM, MORNING_UNTIL = 7 * 60 + 30, 11 * 60
+
+          UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+
+
+          def http_get(url, accept="application/json"):
+              last = None
+              for attempt in range(3):
+                  try:
+                      req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": accept})
+                      with urllib.request.urlopen(req, timeout=25) as r:
+                          return r.read().decode("utf-8", "replace")
+                  except Exception as e:  # повторюємо до 3 разів
+                      last = e
+                      time.sleep(2)
+              raise last
+
+
+          def get_json(url):
+              return json.loads(http_get(url))
+
+
+          def to_float(s):
+              s = s.strip()
+              if "," in s and "." in s:
+                  s = s.replace(",", "")
+              elif "," in s:
+                  s = s.replace(",", ".")
+              return float(s)
+
+
+          def fmt(x, d=2):
+              return f"{x:,.{d}f}".replace(",", " ").replace(".", ",")
+
+
+          def pct(x):
+              return f"{x:+.2f}%".replace(".", ",")
+
+
+          def spot_usd(symbol):
               try:
-                  usd = get(NBP_USD_URL)["rates"][0]["mid"]
-                  lines.append(f"≈ {price / usd:.2f} USD за 1 г")
+                  v = float(get_json(SPOT.format(symbol))["price"])
+                  return v if v > 0 else None
+              except Exception as e:
+                  print(f"[spot {symbol}] недоступно: {e}")
+                  return None
+
+
+          PRICE_RES = [
+              r'<meta[^>]+property=["\']product:price:amount["\'][^>]*content=["\']([0-9][0-9.,]*)["\']',
+              r'<meta[^>]+content=["\']([0-9][0-9.,]*)["\'][^>]*property=["\']product:price:amount["\']',
+              r'"price"\s*:\s*"?([0-9][0-9.]*)"?',
+          ]
+
+
+          def parse_price(html):
+              for rx in PRICE_RES:
+                  m = re.search(rx, html, re.I)
+                  if m:
+                      try:
+                          return to_float(m.group(1))
+                      except ValueError:
+                          continue
+              return None
+
+
+          def bar_price(url, grams, ref_pln_g):
+              """Ціна злитка з сайту Mennica Skarbowa; None, якщо не вдалося або число підозріле."""
+              try:
+                  p = parse_price(http_get(url, "text/html"))
+              except Exception as e:
+                  print(f"[злиток {grams} г] недоступно: {e}")
+                  return None
+              if p is None:
+                  print(f"[злиток {grams} г] ціну на сторінці не знайдено")
+                  return None
+              ratio = p / (grams * ref_pln_g)
+              if not 0.95 <= ratio <= 1.8:  # захист від хибного парсингу
+                  print(f"[злиток {grams} г] підозріла ціна {p}, ігнорую")
+                  return None
+              return p
+
+
+          def snapshot():
+              nbp = get_json(NBP_GOLD)  # від старіших до новіших; без цього працювати нема сенсу
+              try:
+                  usd = float(get_json(NBP_USD)["rates"][0]["mid"])
+              except Exception as e:
+                  print(f"[USD/PLN] недоступно: {e}")
+                  usd = None
+              return {"nbp": nbp, "usd": usd, "xau": spot_usd("XAU"), "xag": spot_usd("XAG")}
+
+
+          def ddmm(iso):
+              return f"{iso[8:10]}.{iso[5:7]}"
+
+
+          def build_report(title, s, now):
+              nbp, usd, xau, xag = s["nbp"], s["usd"], s["xau"], s["xag"]
+              last = nbp[-1]
+              prev = nbp[-2] if len(nbp) > 1 else None
+              price = last["cena"]
+              L = [f"{title}", f"{now:%d.%m.%Y %H:%M}", "", "🥇 Золото"]
+
+              line = f"NBP {ddmm(last['data'])}: {fmt(price)} zł/г"
+              if prev:
+                  line += f" ({pct((price / prev['cena'] - 1) * 100)})"
+              L.append(line)
+
+              gold_g = None
+              if xau:
+                  extra = ""
+                  if usd:
+                      gold_g = xau * usd / OZ
+                      extra = f" ({fmt(xau * usd, 0)} zł/унц · {fmt(gold_g)} zł/г)"
+                  L.append(f"Спот: {fmt(xau, 0)} $/унц{extra}")
+              else:
+                  L.append("Спот: недоступно")
+
+              L += ["", "🥈 Срібло"]
+              if xag:
+                  extra = f" ({fmt(xag * usd, 1)} zł/унц · {fmt(xag * usd / OZ)} zł/г)" if usd else ""
+                  L.append(f"Спот: {fmt(xag, 2)} $/унц{extra}")
+              else:
+                  L.append("Спот: недоступно")
+
+              ref_g, ref_name = (gold_g, "споту") if gold_g else (price, "NBP")
+              L += ["", "🧱 Злитки золота (Mennica Skarbowa)"]
+              for label, url, grams in (("1 г", BAR_1G, 1), ("1 унція", BAR_1OZ, OZ)):
+                  p = bar_price(url, grams, ref_g)
+                  if p:
+                      L.append(f"{label}: {fmt(p, 0)} zł ({pct((p / (grams * ref_g) - 1) * 100)} до {ref_name})")
+                  else:
+                      L.append(f"{label}: недоступно")
+
+              L += ["", "ℹ️ NBP — індикативна ціна; злитки — ціна покупки в магазині."]
+              return "\n".join(L)
+
+
+          def load_state():
+              try:
+                  with open(STATE_FILE, encoding="utf-8") as f:
+                      return json.load(f)
               except Exception:
-                  pass
-              lines.append("ℹ️ Індикативна ціна NBP; у ювелірів і мінцях ціна вища.")
-              return "\n".join(lines)
+                  return {}
 
-          try:
-              text = build()
-          except Exception as e:
-              text = f"⚠️ Не вдалося отримати ціну золота: {e}"
 
-          print(text)
-          token = os.environ["TELEGRAM_TOKEN"]
-          chat = os.environ["TELEGRAM_CHAT_ID"]
-          url = f"https://api.telegram.org/bot{token}/sendMessage"
-          body = urllib.parse.urlencode({"chat_id": chat, "text": text}).encode()
-          urllib.request.urlopen(url, data=body, timeout=20)
-          print("Надіслано")
+          def save_state(st, before):
+              if st != before:
+                  with open(STATE_FILE, "w", encoding="utf-8") as f:
+                      json.dump(st, f, indent=2, sort_keys=True)
+                      f.write("\n")
+
+
+          def reset_baseline(st, s, now):
+              base = st.setdefault("base", {})
+              for key in ("xau", "xag"):
+                  if s[key]:
+                      base[key] = [s[key], now.isoformat(timespec="minutes")]
+
+
+          def check_alerts(st, s, now):
+              """Повертає список текстів сповіщень і оновлює базові ціни."""
+              base = st.setdefault("base", {})
+              out = []
+              for key, name, emoji, thr in (("xau", "Золото", "🥇", ALERT_GOLD),
+                                            ("xag", "Срібло", "🥈", ALERT_SILVER)):
+                  cur = s[key]
+                  if not cur:
+                      continue
+                  if key not in base:  # перший запуск: просто запам'ятовуємо
+                      base[key] = [cur, now.isoformat(timespec="minutes")]
+                      continue
+                  old, when = base[key]
+                  ch = (cur / old - 1) * 100
+                  if abs(ch) >= thr:
+                      t = datetime.fromisoformat(when)
+                      tail = f" ≈ {fmt(cur * s['usd'] / OZ)} zł/г" if s["usd"] else ""
+                      out.append(
+                          f"{'📈' if ch > 0 else '📉'} {name}: {fmt(cur, 2)} $/унц{tail}\n"
+                          f"{pct(ch)} від {t:%d.%m %H:%M} (тоді {fmt(old, 2)} $/унц)"
+                      )
+                      base[key] = [cur, now.isoformat(timespec="minutes")]
+              return out
+
+
+          def send(text):
+              token = os.environ.get("TELEGRAM_TOKEN")
+              chat = os.environ.get("TELEGRAM_CHAT_ID")
+              if not token or not chat:
+                  print("--- (Telegram не налаштовано, друкую в консоль) ---\n" + text)
+                  return
+              body = urllib.parse.urlencode({"chat_id": chat, "text": text}).encode()
+              try:
+                  urllib.request.urlopen(
+                      f"https://api.telegram.org/bot{token}/sendMessage", data=body, timeout=25
+                  ).read()
+              except urllib.error.HTTPError as e:
+                  print("Помилка Telegram:", e.code, e.read().decode("utf-8", "replace")[:300])
+                  sys.exit(1)
+              print("Надіслано:\n" + text)
+
+
+          def now_warsaw():
+              return datetime.now(TZ)
+
+
+          def main():
+              now = now_warsaw()
+              manual = os.environ.get("EVENT_NAME") == "workflow_dispatch"
+              st = load_state()
+              before = copy.deepcopy(st)
+              s = snapshot()
+
+              today = now.date().isoformat()
+              mins = now.hour * 60 + now.minute
+              nbp_new = s["nbp"][-1]["data"] == today and st.get("last_nbp") != today
+              morning = (now.weekday() < 5 and MORNING_FROM <= mins < MORNING_UNTIL
+                         and st.get("last_morning") != today)
+
+              title, mark = None, {}
+              if manual:
+                  title = "🔧 Ручний запит"
+              elif nbp_new:
+                  title, mark = "🏦 NBP оновив ціну золота", {"last_nbp": today}
+              elif morning:
+                  title, mark = "🌅 Ранковий звіт", {"last_morning": today}
+
+              if title:
+                  send(build_report(title, s, now))
+                  st.update(mark)
+                  reset_baseline(st, s, now)
+              else:
+                  for text in check_alerts(st, s, now):
+                      send("⚡ Різка зміна ціни\n" + text)
+                  print("Звіт не потрібен у цей час, перевірено сповіщення.")
+
+              save_state(st, before)
+
+
+          if __name__ == "__main__":
+              main()
           EOF
+
+      - name: Save state
+        run: |
+          if [ -n "$(git status --porcelain state.json)" ]; then
+            git config user.name "gold-bot"
+            git config user.email "gold-bot@users.noreply.github.com"
+            git add state.json
+            git commit -m "Update state"
+            git push
+          fi
